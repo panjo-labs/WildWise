@@ -107,12 +107,20 @@ async def create_quest(
 
 
 @app.post("/ai/explain-observation")
-async def explain_observed_nature(req: AskAIRequest):
+async def explain_observed_nature(req: AskAIRequest, request: Request):
     """Return a model-generated explanation; never substitute an offline answer."""
     if not settings.enable_online_generation:
         raise HTTPException(
             status_code=503,
             detail="AI learning requires online mode. Enable online AI and retry.",
+        )
+
+    # Separate bucket from quests so each feature has its own per-IP budget.
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(f"ask-ai:{client_ip}", max_requests=settings.rate_limit_per_minute):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many AI questions. Please wait a minute and retry.",
         )
 
     try:

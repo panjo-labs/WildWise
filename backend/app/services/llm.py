@@ -13,6 +13,10 @@ from app.data.bundled_quests import get_bundled_quest
 logger = logging.getLogger("wildwise.llm")
 settings = get_settings()
 ASK_AI_MODEL_ID = "nvidia/nemotron-3.5-lightning:free"
+# Headroom for models that spend part of the budget on reasoning before the JSON.
+ASK_AI_MAX_TOKENS = 1500
+# Short 3-challenge quests only need a few hundred tokens; a lower cap also bounds latency.
+QUEST_MAX_TOKENS = 800
 
 # Safety instructions jo har prompt ke saath jaate hain
 SAFETY_PREAMBLE = """
@@ -52,7 +56,7 @@ Return ONLY a valid JSON object with this exact structure (no markdown, no conve
   ]
 }}
 
-Generate exactly 3-5 challenges. Make them engaging, safe, and suited to {req.difficulty.value} level.
+Generate exactly 3 challenges, suited to {req.difficulty.value} level. Keep it brief: the introduction at most 2 short sentences, each instruction and fact one short sentence (under 25 words), and the whole reply under 200 words.
 Return only the raw JSON object, nothing else."""
 
 
@@ -62,7 +66,100 @@ def _extract_json(raw: str) -> dict:
     if match:
         raw = match.group(1)
     raw = raw.strip()
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        # Models sometimes wrap the object in prose; take the first decodable {...}.
+        decoder = json.JSONDecoder()
+        for start in (m.start() for m in re.finditer(r"\{", raw)):
+            try:
+                candidate, _ = decoder.raw_decode(raw, start)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                return candidate
+        raise exc
+
+
+def _provider_error_summary(response) -> str:
+    """Safe one-line summary of an OpenRouter error body (code + short provider message).
+
+    Only the provider's own error fields are read; the request, headers and key
+    are never included.
+    """
+    try:
+        error = response.json().get("error")
+    except Exception:
+        return "body=unreadable"
+    if not isinstance(error, dict):
+        return "body=no_error_field"
+    message = str(error.get("message", ""))[:200].replace("\n", " ")
+    return f"provider_code={error.get('code')} provider_message={message!r}"
+
+
+class _ExplanationOutputError(Exception):
+    """Provider reply cannot be turned into a valid AskAIResponse.
+
+    `reason` and `details` are safe to log: they never contain model text,
+    user observations, or credentials.
+    """
+
+    def __init__(self, reason: str, details: str = ""):
+        super().__init__(reason)
+        self.reason = reason
+        self.details = details
+
+
+def _message_text(content) -> str:
+    """Return assistant text from a string or a list of OpenAI-style text parts."""
+    if isinstance(content, list):
+        content = "".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
+    if not isinstance(content, str):
+        return ""
+    # Some reasoning models inline their thinking in <think> tags before the answer.
+    return re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+
+
+def _parse_explanation(body) -> AskAIResponse:
+    """Validate a chat-completions body strictly, with a distinct reason per failure."""
+    if not isinstance(body, dict):
+        raise _ExplanationOutputError("body_not_object")
+
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        error = body.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        raise _ExplanationOutputError("no_choices", f"provider_error_code={code}" if error else "")
+
+    choice = choices[0]
+    finish_reason = choice.get("finish_reason")
+    message = choice.get("message")
+    message = message if isinstance(message, dict) else {}
+    text = _message_text(message.get("content"))
+    if not text:
+        has_reasoning = bool(message.get("reasoning"))
+        reason = "truncated_empty_content" if finish_reason == "length" else "empty_content"
+        raise _ExplanationOutputError(reason, f"finish_reason={finish_reason} has_reasoning={has_reasoning}")
+
+    try:
+        data = _extract_json(text)
+    except json.JSONDecodeError as exc:
+        reason = "truncated_json" if finish_reason == "length" else "malformed_json"
+        # Shape only (no text): does the reply start with JSON, or with preamble/thinking?
+        shape = f"starts_with_brace={text.lstrip().startswith('{')} has_think_tag={'<think>' in text}"
+        raise _ExplanationOutputError(
+            reason, f"finish_reason={finish_reason} content_chars={len(text)} {shape}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise _ExplanationOutputError("json_not_object", f"type={type(data).__name__}")
+
+    try:
+        return AskAIResponse.model_validate(data)
+    except ValidationError as exc:
+        # Field names and error types only; `input` values are model/user text.
+        problems = ",".join(sorted({f"{'.'.join(map(str, e['loc']))}:{e['type']}" for e in exc.errors()}))
+        raise _ExplanationOutputError("schema_mismatch", problems) from exc
 
 
 def _build_observation_prompt(req: AskAIRequest) -> str:
@@ -81,6 +178,8 @@ Safety and accuracy rules:
 <category>{req.category}</category>
 <quest_instruction>{req.instruction}</quest_instruction>
 <user_observation>{req.observation}</user_observation>
+
+Output rules: reply with the JSON object only, with no text, markdown, or code fence before or after it. Each field must be plain text of at most 2 short sentences (under 40 words), with no lists, and the whole reply must stay under 250 words.
 
 Return only a JSON object with exactly these concise string fields:
 {{
@@ -106,7 +205,10 @@ async def explain_observation(req: AskAIRequest) -> AskAIResponse:
         "model": ASK_AI_MODEL_ID,
         "messages": [{"role": "user", "content": _build_observation_prompt(req)}],
         "temperature": 0.3,
-        "max_tokens": 700,
+        "max_tokens": ASK_AI_MAX_TOKENS,
+        # Nemotron is a reasoning model; thinking tokens were exhausting max_tokens before the JSON ended.
+        # OpenRouter ignores this where the model cannot disable reasoning.
+        "reasoning": {"enabled": False},
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -117,19 +219,33 @@ async def explain_observation(req: AskAIRequest) -> AskAIResponse:
     endpoint = f"{settings.active_api_base.rstrip('/')}/chat/completions"
 
     try:
-        async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=settings.ask_ai_timeout_seconds) as client:
             response = await client.post(endpoint, json=payload, headers=headers)
             response.raise_for_status()
-            raw_content = response.json()["choices"][0]["message"]["content"]
-            return AskAIResponse(**_extract_json(raw_content))
+            body = response.json()
+            try:
+                return _parse_explanation(body)
+            except _ExplanationOutputError as exc:
+                usage = body.get("usage") if isinstance(body, dict) else None
+                completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+                logger.warning(
+                    "Ask AI output rejected: reason=%s %s completion_tokens=%s max_tokens=%s",
+                    exc.reason, exc.details, completion_tokens, ASK_AI_MAX_TOKENS,
+                )
+                raise RuntimeError("The AI returned an invalid explanation. Please retry.") from exc
     except httpx.TimeoutException as exc:
         logger.warning("Online observation explanation timed out.")
         raise TimeoutError("AI explanation timed out. Please retry.") from exc
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code if exc.response is not None else 500
-        logger.warning("OpenRouter returned HTTP status for observation explanation: %s", status)
+        logger.warning(
+            "OpenRouter returned HTTP status for observation explanation: %s %s",
+            status, _provider_error_summary(exc.response),
+        )
         if status == 401:
             raise PermissionError("AI provider credentials are invalid.") from exc
+        if status == 429:
+            raise RuntimeError("The free AI model is busy or rate limited. Wait a minute and retry.") from exc
         raise RuntimeError("Online AI is unavailable. Please retry.") from exc
     except httpx.RequestError as exc:
         logger.warning("Online observation explanation request failed: %s", type(exc).__name__)
@@ -175,7 +291,9 @@ async def generate_quest(req: QuestRequest, allow_fallback: bool = True) -> Ques
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
-        "max_tokens": 1500,
+        "max_tokens": QUEST_MAX_TOKENS,
+        # Same reasoning-model issue as Ask AI: thinking tokens can exhaust max_tokens.
+        "reasoning": {"enabled": False},
     }
 
     # Security: kabhi bhi sensitive headers ya API keys log mat karo
@@ -196,7 +314,7 @@ async def generate_quest(req: QuestRequest, allow_fallback: bool = True) -> Ques
                 headers=headers,
             )
             response.raise_for_status()
-            raw_content = response.json()["choices"][0]["message"]["content"]
+            raw_content = _message_text(response.json()["choices"][0]["message"]["content"])
             data = _extract_json(raw_content)
             data["is_offline"] = False
             data["source"] = "ai_generated"
@@ -214,7 +332,7 @@ async def generate_quest(req: QuestRequest, allow_fallback: bool = True) -> Ques
         raise TimeoutError(f"Model request timed out after {settings.llm_timeout_seconds}s") from e
     except httpx.HTTPStatusError as e:
         status = e.response.status_code if e.response is not None else 500
-        logger.warning("Online provider returned HTTP status: %s", status)
+        logger.warning("Online provider returned HTTP status: %s %s", status, _provider_error_summary(e.response))
         if status == 401:
             raise PermissionError("Invalid API key. Check OPENROUTER_API_KEY.") from e
         if allow_fallback:

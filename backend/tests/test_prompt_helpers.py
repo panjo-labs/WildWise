@@ -36,3 +36,15 @@ async def test_test_guard_blocks_openrouter_transport():
     async with httpx.AsyncClient() as client:
         with pytest.raises(AssertionError, match="Network access is disabled during tests"):
             await client.get("https://openrouter.ai/api/v1/health")
+
+def test_quest_prompt_asks_for_a_short_three_challenge_reply():
+    from app.schemas import QuestRequest
+    from app.services.llm import QUEST_MAX_TOKENS, _build_prompt
+
+    prompt = _build_prompt(
+        QuestRequest(environment="Park", duration_minutes=10, interests=["Birds"], difficulty="Beginner")
+    )
+
+    assert "exactly 3 challenges" in prompt
+    assert "under 200 words" in prompt
+    assert QUEST_MAX_TOKENS <= 1000

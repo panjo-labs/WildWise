@@ -75,9 +75,12 @@ export async function explainObservation(params) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(params),
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(60000), // must outlast the backend's Ask AI timeout (45s)
     });
-  } catch {
+  } catch (err) {
+    if (err?.name === "TimeoutError") {
+      throw new Error("The AI is taking too long to answer. Please retry.");
+    }
     throw new Error("AI learning requires online mode and a working connection. Please retry.");
   }
 

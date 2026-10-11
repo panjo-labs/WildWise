@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # Request timeout in seconds
     llm_timeout_seconds: int = 15
 
+    # Ask AI has no offline fallback and the free model can be slow, so it waits longer
+    ask_ai_timeout_seconds: int = 45
+
     # Simple in-memory rate limiting (max quest generation requests per minute per IP)
     rate_limit_per_minute: int = 10
 

@@ -20,3 +20,12 @@ def disable_online_generation_and_network(monkeypatch):
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", block_sync_http)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", block_async_http)
+
+@pytest.fixture(autouse=True)
+def reset_rate_limit_history():
+    """Rate-limit buckets are module-global; keep tests independent of each other."""
+    from app.main import _request_history
+
+    _request_history.clear()
+    yield
+    _request_history.clear()
