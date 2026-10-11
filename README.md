@@ -150,19 +150,30 @@ python -m pytest tests/ -v
 ### Backend (Web Service)
 - **Root Directory**: `backend`
 - **Build Command**: `pip install -r requirements.txt`
-- **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips "*"`
+  - The proxy flags make the per-IP rate limit see each visitor's real IP. Without them, every visitor appears to come from Render's proxy and shares one limit.
 - **Environment Variables**:
-  - `ENABLE_ONLINE_GENERATION`: `false` (or `true` if you wish to enable online calls)
-  - `FRONTEND_URL`: `https://your-frontend.onrender.com`
-  - `OPENROUTER_API_KEY`: *(Private key from OpenRouter, leave blank if offline)*
+  - `ENABLE_ONLINE_GENERATION`: `false` (or `true` if you wish to enable online calls and Ask AI)
+  - `FRONTEND_URL`: `https://your-frontend.onrender.com` (exact origin: `https`, no trailing slash, otherwise the browser blocks requests with CORS)
+  - `OPENROUTER_API_KEY`: *(Private key from OpenRouter, set only in the Render dashboard; leave blank if offline)*
   - `OPENROUTER_MODEL_ID`: `nvidia/nemotron-3.5-lightning:free`
+  - `PYTHON_VERSION`: `3.10.14` *(optional; matches the version used in development)*
+  - `ASK_AI_TIMEOUT_SECONDS` / `LLM_TIMEOUT_SECONDS` / `RATE_LIMIT_PER_MINUTE`: *(optional; defaults are 45, 15 and 10)*
+- **Check**: open `https://your-backend.onrender.com/health`. It should report `"online_generation_enabled": true`. The root URL `/` returns `{"detail":"Not Found"}` by design, because the backend is an API only.
 
 ### Frontend (Static Site)
 - **Root Directory**: `Frontend`
 - **Build Command**: `npm install && npm run build`
 - **Publish Directory**: `dist`
 - **Environment Variables**:
-  - `VITE_API_URL`: `https://your-backend.onrender.com`
+  - `VITE_API_URL`: `https://your-backend.onrender.com` (no trailing slash; Vite bakes this in at build time, so redeploy the static site after changing it)
+
+### Deployment notes
+- **Deploy order**: backend first, then the frontend, then set the backend's `FRONTEND_URL` to the frontend's URL.
+- **Free-plan cold starts**: an idle free web service sleeps and can take 30-60 seconds to wake. The first quest request may fall back to an offline quest and the first Ask AI click may fail; open `/health` first and retry.
+- **Free-model privacy**: OpenRouter's free endpoint logs prompts and may use them to improve the model. Do not enter personal or sensitive details in observations.
+- **Secrets**: never commit `backend/.env`. If a key is ever exposed, rotate it at https://openrouter.ai/keys.
+- **Troubleshooting Ask AI**: backend logs show a safe line such as `Ask AI output rejected: reason=...` or `provider_code=... provider_message=...`. These never include keys or your observation text.
 
 ---
 
